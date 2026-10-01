@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "RiffMaster",
+    "slug": "frontend",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "frontend",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.emergent.riffmentor.m3u28m",
+      "infoPlist": {
+        "NSCameraUsageDescription": "See your technique for live AI feedback",
+        "NSMicrophoneUsageDescription": "Hear your playing for pitch and rhythm feedback"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#121212"
+      },
+      "package": "com.emergent.riffmentor.m3u28m",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#121212"
+        }
+      ],
+      "expo-font",
+      "expo-image",
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-status-bar",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "See your technique for live AI feedback"
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Hear your playing for pitch and rhythm feedback"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
