@@ -9,6 +9,7 @@ import { LogOut, Award, Flame, Zap, Target } from "lucide-react-native";
 import { apiFetch } from "@/src/api/client";
 import { useAuth } from "@/src/auth/AuthContext";
 import { useTheme, makeStyles, spacing, radius } from "@/src/theme";
+import { VoicePicker } from "@/src/components/VoicePicker";
 
 type BadgeRef = { id: string; name: string; description: string; earned: boolean };
 type Progress = {
@@ -191,6 +192,8 @@ export default function ProfileTab() {
                 </View>
               ))}
             </View>
+
+            <VoicePicker />
           </>
         )}
 

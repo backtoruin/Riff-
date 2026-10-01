@@ -22,7 +22,8 @@ import {
   Volume2,
   CircleDot,
   Image as ImageIcon,
-  Loader2,
+  Music,
+  Upload,
 } from "lucide-react-native";
 
 import { apiFetch, BACKEND_URL, getToken } from "@/src/api/client";
@@ -30,9 +31,11 @@ import { useTheme, makeStyles, spacing, radius } from "@/src/theme";
 import { RiffMark } from "@/src/components/RiffMark";
 import { ChatBubble, ChatMessage } from "@/src/components/ChatBubble";
 import { PitchMeter } from "@/src/components/PitchMeter";
+import { RhythmCoach } from "@/src/components/RhythmCoach";
 import { startPitchDetection, PitchState } from "@/src/lib/pitch";
 import { startMidi, MidiState } from "@/src/lib/midi";
 import { recordWebClip, recordNativeClip } from "@/src/lib/record";
+import { pickMediaForUpload } from "@/src/lib/upload";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 
 const useStyles = makeStyles((colors) => ({
@@ -52,12 +55,15 @@ const useStyles = makeStyles((colors) => ({
 
   gear: {
     flexDirection: "row",
-    gap: spacing.sm,
+    flexWrap: "wrap",
+    columnGap: spacing.sm,
+    rowGap: spacing.sm,
     paddingHorizontal: spacing.lg,
     paddingBottom: spacing.sm,
   },
   gearBtn: {
-    flex: 1,
+    flexBasis: "48%",
+    flexGrow: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -266,6 +272,8 @@ export default function StudioTab() {
   const [thinkingLabel, setThinkingLabel] = useState<string | null>(null);
   const [cameraOn, setCameraOn] = useState(false);
   const [listening, setListening] = useState(false);
+  const [rhythmOn, setRhythmOn] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recCountdown, setRecCountdown] = useState(0);
   const [midi, setMidi] = useState<MidiState>({ supported: false, devices: [], events: [] });
@@ -282,7 +290,10 @@ export default function StudioTab() {
   const scrollRef = useRef<ScrollView | null>(null);
   const pitchStopRef = useRef<null | (() => void)>(null);
   const midiStopRef = useRef<null | (() => void)>(null);
-  const audioPlayerRef = useRef<any>(null);
+  // Single-slot audio player. Any new play must stop whatever is here first.
+  const currentAudioRef = useRef<any>(null);
+  const playingMsgIdRef = useRef<string | null>(null);
+  const playTokenRef = useRef(0);
   const sessionLogged = useRef(false);
 
   // Native recorder (ignored on web)
@@ -339,13 +350,9 @@ export default function StudioTab() {
     return () => {
       pitchStopRef.current?.();
       midiStopRef.current?.();
-      if (audioPlayerRef.current) {
-        try {
-          audioPlayerRef.current.pause?.();
-          audioPlayerRef.current.remove?.();
-        } catch {}
-      }
+      stopCurrentAudio();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Log a session when leaving (only once)
@@ -376,43 +383,91 @@ export default function StudioTab() {
     );
   };
 
-  const playTTS = useCallback(async (text: string) => {
+  const stopCurrentAudio = useCallback(() => {
+    const a = currentAudioRef.current;
+    if (!a) return;
     try {
-      const token = await getToken();
-      const res = await fetch(`${BACKEND_URL}/api/tts`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token ?? ""}`,
-        },
-        body: JSON.stringify({ text }),
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      const audioUrl = `${BACKEND_URL}${data.url}`;
       if (Platform.OS === "web") {
-        const a = new (globalThis as any).Audio(audioUrl);
-        a.play().catch(() => {});
+        a.pause?.();
+        try { a.src = ""; } catch {}
       } else {
-        const { createAudioPlayer, setAudioModeAsync } = await import("expo-audio");
-        try {
-          await setAudioModeAsync({
-            playsInSilentMode: true,
-            allowsRecording: false,
-          } as any);
-        } catch {}
-        if (audioPlayerRef.current) {
-          try {
-            audioPlayerRef.current.pause?.();
-            audioPlayerRef.current.remove?.();
-          } catch {}
-        }
-        const player = createAudioPlayer({ uri: audioUrl });
-        audioPlayerRef.current = player;
-        player.play();
+        a.pause?.();
+        a.remove?.();
       }
     } catch {}
+    currentAudioRef.current = null;
+    playingMsgIdRef.current = null;
   }, []);
+
+  const playTTS = useCallback(
+    async (text: string, msgId?: string) => {
+      // De-dup: user double-taps the same message's play button.
+      if (msgId && playingMsgIdRef.current === msgId) return;
+
+      // Enforce "only one audio at a time" per TTS playbook.
+      stopCurrentAudio();
+
+      const myToken = ++playTokenRef.current;
+      playingMsgIdRef.current = msgId ?? null;
+
+      try {
+        const token = await getToken();
+        const res = await fetch(`${BACKEND_URL}/api/tts`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token ?? ""}`,
+          },
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) {
+          playingMsgIdRef.current = null;
+          return;
+        }
+        // If another play started while we awaited, abandon this one.
+        if (myToken !== playTokenRef.current) return;
+
+        const data = await res.json();
+        const audioUrl = `${BACKEND_URL}${data.url}`;
+
+        if (Platform.OS === "web") {
+          const a = new (globalThis as any).Audio(audioUrl);
+          currentAudioRef.current = a;
+          a.onended = () => {
+            if (currentAudioRef.current === a) {
+              currentAudioRef.current = null;
+              playingMsgIdRef.current = null;
+            }
+          };
+          a.onerror = () => {
+            if (currentAudioRef.current === a) {
+              currentAudioRef.current = null;
+              playingMsgIdRef.current = null;
+            }
+          };
+          try { await a.play(); } catch {}
+        } else {
+          const { createAudioPlayer, setAudioModeAsync } = await import(
+            "expo-audio"
+          );
+          try {
+            await setAudioModeAsync({
+              playsInSilentMode: true,
+              allowsRecording: false,
+            } as any);
+          } catch {}
+          // Second check after awaits.
+          if (myToken !== playTokenRef.current) return;
+          const player = createAudioPlayer({ uri: audioUrl });
+          currentAudioRef.current = player;
+          player.play();
+        }
+      } catch {
+        playingMsgIdRef.current = null;
+      }
+    },
+    [stopCurrentAudio],
+  );
 
   const sendMessageMut = useMutation({
     mutationFn: async (payload: {
@@ -420,6 +475,8 @@ export default function StudioTab() {
       image_base64?: string;
       audio_base64?: string;
       audio_mime?: string;
+      video_base64?: string;
+      video_mime?: string;
       context?: string;
     }) => {
       return apiFetch<{ id: string; role: "assistant"; text: string }>(
@@ -436,7 +493,9 @@ export default function StudioTab() {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
         () => {},
       );
-      void playTTS(reply.text);
+      // No auto-play: the user taps "HEAR RIFF SAY IT" to play.
+      // This avoids the double-play bug where tapping the button overlapped
+      // with the automatic playback.
       qc.invalidateQueries({ queryKey: ["progress"] });
     },
   });
@@ -588,6 +647,72 @@ export default function StudioTab() {
     }
   }, [recording, nativeRecorder, midi, buildAudioContext, sendMessageMut]);
 
+  const pickAndUpload = useCallback(async () => {
+    if (uploading) return;
+    setUploading(true);
+    try {
+      const picked = await pickMediaForUpload();
+      if (!picked) return; // user canceled
+      if ("reason" in (picked as any)) {
+        const reason = (picked as any).reason;
+        const txt =
+          reason === "too_large"
+            ? "That file is bigger than 20 MB — try trimming it or sending a shorter clip."
+            : reason === "unsupported"
+            ? "That file type isn't supported. Try an MP3, MP4, WAV, or MOV."
+            : "Couldn't open that file — try picking it again?";
+        setMessages((m) => [
+          ...m,
+          { id: `s-${Date.now()}`, role: "assistant", text: txt },
+        ]);
+        return;
+      }
+      const p = picked as Exclude<Awaited<ReturnType<typeof pickMediaForUpload>>, null | { kind: "error"; reason: any }>;
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+      setMessages((m) => [
+        ...m,
+        {
+          id: `u-${Date.now()}`,
+          role: "user",
+          text: `📎 Uploaded "${p.name}" (${Math.round(p.bytes / 1024)} KB) — please analyze.`,
+        },
+      ]);
+      scrollToEnd();
+      setThinkingLabel(
+        p.kind === "video" ? "Riff is watching your clip…" : "Riff is listening to your clip…",
+      );
+      setSending(true);
+      const payload: any = {
+        text:
+          p.kind === "video"
+            ? "Please watch this clip of me playing and critique my technique, timing, and tone. Pick 1–2 priorities."
+            : "Please listen to this recording and critique my playing — timing, pitch, tone, feel. Pick 1–2 priorities.",
+        context: `Student uploaded a ${p.kind} file "${p.name}" (${p.mime}, ${Math.round(p.bytes / 1024)} KB).`,
+      };
+      if (p.kind === "audio") {
+        payload.audio_base64 = p.base64;
+        payload.audio_mime = p.mime;
+      } else {
+        payload.video_base64 = p.base64;
+        payload.video_mime = p.mime;
+      }
+      await sendMessageMut.mutateAsync(payload);
+    } catch {
+      setMessages((m) => [
+        ...m,
+        {
+          id: `s-${Date.now()}`,
+          role: "assistant",
+          text: "Hmm — the upload didn't go through. Try again?",
+        },
+      ]);
+    } finally {
+      setSending(false);
+      setThinkingLabel(null);
+      setUploading(false);
+    }
+  }, [uploading, sendMessageMut]);
+
   const sendText = useCallback(async () => {
     const txt = input.trim();
     if (!txt || sending) return;
@@ -674,7 +799,36 @@ export default function StudioTab() {
               LISTEN
             </Text>
           </Pressable>
+          <Pressable
+            testID="studio-toggle-rhythm"
+            onPress={() => setRhythmOn((v) => !v)}
+            style={[styles.gearBtn, rhythmOn && styles.gearBtnActive]}
+          >
+            <Music
+              size={14}
+              color={rhythmOn ? colors.brand : colors.onSurfaceTertiary}
+            />
+            <Text style={[styles.gearTxt, rhythmOn && styles.gearTxtActive]}>
+              RHYTHM
+            </Text>
+          </Pressable>
+          <Pressable
+            testID="studio-upload-button"
+            onPress={pickAndUpload}
+            disabled={uploading || sending}
+            style={[styles.gearBtn, uploading && styles.gearBtnActive, (uploading || sending) && { opacity: 0.6 }]}
+          >
+            <Upload
+              size={14}
+              color={uploading ? colors.brand : colors.onSurfaceTertiary}
+            />
+            <Text style={[styles.gearTxt, uploading && styles.gearTxtActive]}>
+              {uploading ? "UPLOADING…" : "UPLOAD"}
+            </Text>
+          </Pressable>
         </View>
+
+        {rhythmOn && <RhythmCoach />}
 
         {cameraOn && (
           <View style={styles.camPanel} testID="studio-camera-panel">
@@ -776,7 +930,7 @@ export default function StudioTab() {
               {m.role === "assistant" && m.id !== "welcome" && (
                 <Pressable
                   testID={`speak-${m.id}`}
-                  onPress={() => playTTS(m.text)}
+                  onPress={() => playTTS(m.text, m.id)}
                   style={[
                     styles.listenHintBtn,
                     { paddingLeft: spacing.lg + spacing.md },

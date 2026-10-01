@@ -17,6 +17,10 @@ from datetime import datetime, timezone, timedelta, date
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, FileContentWithMimeType, TextDelta, StreamDone
 from emergentintegrations.llm.openai import OpenAITextToSpeech
 import base64 as b64lib
+import wave
+import io as _io
+import asyncio
+import numpy as np
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -30,6 +34,12 @@ EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 # TTS cache dir
 TTS_DIR = Path("/tmp/riff_tts")
 TTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Rhythm Coach dirs
+SYLLABLE_DIR = Path("/tmp/riff_syllables")
+SYLLABLE_DIR.mkdir(parents=True, exist_ok=True)
+METRONOME_DIR = Path("/tmp/riff_metronome")
+METRONOME_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -79,6 +89,8 @@ class ChatMessageIn(BaseModel):
     image_base64: Optional[str] = None  # Camera frame for vision analysis
     audio_base64: Optional[str] = None  # Audio clip for hearing analysis
     audio_mime: Optional[str] = None    # e.g., "audio/webm", "audio/m4a", "audio/wav"
+    video_base64: Optional[str] = None  # Uploaded video clip for Gemini video analysis
+    video_mime: Optional[str] = None    # e.g., "video/mp4", "video/quicktime"
     context: Optional[str] = None  # e.g. "live-audio-data" or "midi-notes"
 
 
@@ -91,6 +103,15 @@ class ChatMessageOut(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    instructions: Optional[str] = None  # Only used with gpt-4o-mini-tts
+
+
+class VoicePrefIn(BaseModel):
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    instructions: Optional[str] = None
 
 
 class CompleteLessonIn(BaseModel):
@@ -638,6 +659,26 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
                     prompt = "Listen to this clip of me playing and tell me what to work on."
             except Exception:
                 logger.exception("audio decode failed")
+        if body.video_base64:
+            vmime = (body.video_mime or "video/mp4").split(";")[0].strip().lower()
+            vext_map = {
+                "video/mp4": "mp4", "video/quicktime": "mov", "video/mov": "mov",
+                "video/x-m4v": "m4v", "video/webm": "webm", "video/3gpp": "3gp",
+                "video/x-matroska": "mkv",
+            }
+            vext = vext_map.get(vmime, "mp4")
+            try:
+                video_bytes = b64lib.b64decode(body.video_base64)
+                tmp = Path(f"/tmp/riff_video_{uuid.uuid4().hex}.{vext}")
+                tmp.write_bytes(video_bytes)
+                tmp_files.append(tmp)
+                file_contents.append(
+                    FileContentWithMimeType(file_path=str(tmp), mime_type=vmime)
+                )
+                if not prompt.strip():
+                    prompt = "Please watch this video of me playing and critique my technique and timing."
+            except Exception:
+                logger.exception("video decode failed")
 
         um = (
             UserMessage(text=prompt, file_contents=file_contents)
@@ -682,6 +723,100 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
 # =============================================================================
 # TTS
 # =============================================================================
+# =============================================================================
+# TTS — Emergent-managed OpenAI (user picks model + voice)
+# =============================================================================
+TTS_MODELS = [
+    {"id": "tts-1", "label": "Fast", "steerable": False,
+     "description": "Fastest + cheapest — great for live chat."},
+    {"id": "tts-1-hd", "label": "High Quality", "steerable": False,
+     "description": "Higher audio fidelity, slower generation."},
+    {"id": "gpt-4o-mini-tts", "label": "Steerable", "steerable": True,
+     "description": "Describe the delivery (tone, pace, mood) in words."},
+]
+TTS_VOICES_SHARED = [
+    {"id": "alloy", "label": "Alloy — neutral & balanced"},
+    {"id": "ash", "label": "Ash — clear & articulate"},
+    {"id": "coral", "label": "Coral — warm & friendly"},
+    {"id": "echo", "label": "Echo — smooth & calm"},
+    {"id": "fable", "label": "Fable — expressive, storytelling"},
+    {"id": "nova", "label": "Nova — energetic & upbeat"},
+    {"id": "onyx", "label": "Onyx — deep & authoritative"},
+    {"id": "sage", "label": "Sage — wise & measured"},
+    {"id": "shimmer", "label": "Shimmer — bright & cheerful"},
+]
+TTS_VOICES_EXTRA = [  # gpt-4o-mini-tts only
+    {"id": "ballad", "label": "Ballad — soft & lyrical"},
+    {"id": "verse", "label": "Verse — narrative, versatile"},
+]
+_VOICE_IDS = {v["id"] for v in TTS_VOICES_SHARED + TTS_VOICES_EXTRA}
+_EXTRA_VOICE_IDS = {v["id"] for v in TTS_VOICES_EXTRA}
+_MODEL_IDS = {m["id"] for m in TTS_MODELS}
+
+
+def _coerce_voice_model(voice: Optional[str], model: Optional[str],
+                        instructions: Optional[str]) -> tuple[str, str, Optional[str]]:
+    voice = voice if (voice and voice in _VOICE_IDS) else "onyx"
+    model = model if (model and model in _MODEL_IDS) else "tts-1"
+    if model != "gpt-4o-mini-tts":
+        if voice in _EXTRA_VOICE_IDS:
+            voice = "onyx"
+        instructions = None
+    return voice, model, (instructions or None)
+
+
+async def _resolve_user_voice(user_id: str) -> tuple[str, str, Optional[str]]:
+    u = await db.users.find_one(
+        {"user_id": user_id},
+        {"_id": 0, "tts_voice": 1, "tts_model": 1, "tts_instructions": 1},
+    )
+    return _coerce_voice_model(
+        (u or {}).get("tts_voice"),
+        (u or {}).get("tts_model"),
+        (u or {}).get("tts_instructions"),
+    )
+
+
+@api_router.get("/tts/voices")
+async def tts_voices(authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    voice, model, instructions = await _resolve_user_voice(user.user_id)
+    return {
+        "models": TTS_MODELS,
+        "voices": TTS_VOICES_SHARED,
+        "extra_voices": TTS_VOICES_EXTRA,
+        "current": {"voice": voice, "model": model, "instructions": instructions},
+    }
+
+
+@api_router.get("/me/tts-voice")
+async def get_tts_voice(authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    voice, model, instructions = await _resolve_user_voice(user.user_id)
+    return {"voice": voice, "model": model, "instructions": instructions}
+
+
+@api_router.post("/me/tts-voice")
+async def set_tts_voice(body: VoicePrefIn,
+                        authorization: Optional[str] = Header(None)):
+    user = await get_current_user(authorization)
+    cur_v, cur_m, cur_i = await _resolve_user_voice(user.user_id)
+    voice, model, instructions = _coerce_voice_model(
+        body.voice if body.voice is not None else cur_v,
+        body.model if body.model is not None else cur_m,
+        body.instructions if body.instructions is not None else cur_i,
+    )
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$set": {
+            "tts_voice": voice,
+            "tts_model": model,
+            "tts_instructions": instructions,
+        }},
+    )
+    return {"voice": voice, "model": model, "instructions": instructions}
+
+
 def _clean_for_tts(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)
@@ -692,24 +827,38 @@ def _clean_for_tts(text: str) -> str:
 
 @api_router.post("/tts")
 async def tts_generate(body: TTSRequest, authorization: Optional[str] = Header(None)):
-    await get_current_user(authorization)
+    user = await get_current_user(authorization)
     cleaned = _clean_for_tts(body.text)
     if not cleaned:
         raise HTTPException(status_code=400, detail="empty_text")
-    voice = "onyx"
-    model = "tts-1"
-    key = hashlib.sha256(f"{cleaned}|{voice}|{model}|mp3".encode()).hexdigest()
+    stored_v, stored_m, stored_i = await _resolve_user_voice(user.user_id)
+    voice, model, instructions = _coerce_voice_model(
+        body.voice if body.voice is not None else stored_v,
+        body.model if body.model is not None else stored_m,
+        body.instructions if body.instructions is not None else stored_i,
+    )
+    key = hashlib.sha256(
+        f"{cleaned}|{voice}|{model}|mp3|{instructions or ''}".encode()
+    ).hexdigest()
     out = TTS_DIR / f"{key}.mp3"
     if not out.exists():
         try:
             tts = OpenAITextToSpeech(api_key=EMERGENT_LLM_KEY)
-            audio = await tts.generate_speech(text=cleaned, model=model, voice=voice,
-                                              response_format="mp3")
+            kwargs = {
+                "text": cleaned, "model": model, "voice": voice,
+                "response_format": "mp3",
+            }
+            if instructions and model == "gpt-4o-mini-tts":
+                kwargs["instructions"] = instructions
+            audio = await tts.generate_speech(**kwargs)
             out.write_bytes(audio)
         except Exception as e:
             logger.exception("tts failed")
             raise HTTPException(status_code=502, detail="tts_failed") from e
-    return {"key": key, "ext": "mp3", "url": f"/api/tts/{key}.mp3"}
+    return {
+        "key": key, "ext": "mp3", "url": f"/api/tts/{key}.mp3",
+        "voice": voice, "model": model,
+    }
 
 
 @api_router.get("/tts/{key}.mp3")
@@ -719,6 +868,265 @@ async def tts_fetch(key: str):
         raise HTTPException(status_code=404, detail="not_found")
     return FileResponse(out, media_type="audio/mpeg",
                         headers={"Cache-Control": "public, max-age=31536000"})
+
+
+# =============================================================================
+# RHYTHM COACH — vocal counting at a target BPM, sample-accurate
+# =============================================================================
+RHYTHM_PATTERNS = {
+    "quarters": {
+        "label": "1 · 2 · 3 · 4",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [("one", 0.0), ("two", 1.0), ("three", 2.0), ("four", 3.0)],
+    },
+    "eighths": {
+        "label": "1 and 2 and 3 and 4 and",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [
+            ("one", 0.0), ("and", 0.5), ("two", 1.0), ("and", 1.5),
+            ("three", 2.0), ("and", 2.5), ("four", 3.0), ("and", 3.5),
+        ],
+    },
+    "sixteenths": {
+        "label": "1 e and a (16ths)",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [
+            ("one", 0.0), ("e", 0.25), ("and", 0.5), ("a", 0.75),
+            ("two", 1.0), ("e", 1.25), ("and", 1.5), ("a", 1.75),
+            ("three", 2.0), ("e", 2.25), ("and", 2.5), ("a", 2.75),
+            ("four", 3.0), ("e", 3.25), ("and", 3.5), ("a", 3.75),
+        ],
+    },
+    "ta_pulse": {
+        "label": "Ta (steady pulse)",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [("ta", 0.0), ("ta", 1.0), ("ta", 2.0), ("ta", 3.0)],
+    },
+    "takita": {
+        "label": "Ta ki ta (triplets)",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [
+            (s, beat + i / 3.0)
+            for beat in range(4)
+            for i, s in enumerate(["ta", "ki", "ta"])
+        ],
+    },
+    "takadimi": {
+        "label": "Ta ka di mi (16ths)",
+        "beats_per_bar": 4,
+        "syllables_per_bar": [
+            (s, beat + i / 4.0)
+            for beat in range(4)
+            for i, s in enumerate(["ta", "ka", "di", "mi"])
+        ],
+    },
+}
+
+
+ALLOWED_METRONOME_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+
+# What we actually send to TTS (the pattern keeps the display syllable).
+TTS_SPELLING = {
+    "e": "ee",
+    "a": "ah",
+    "ki": "kee",
+    "di": "dee",
+    "mi": "mee",
+    "ka": "kah",
+    "ta": "tah",
+}
+
+
+async def _get_syllable_wav(syl: str, voice: str = "onyx") -> bytes:
+    """Fetch (or cache) a WAV of a single syllable from OpenAI TTS."""
+    spoken = TTS_SPELLING.get(syl, syl)
+    key = hashlib.sha256(f"{spoken}|{voice}|tts-1|wav".encode()).hexdigest()
+    p = SYLLABLE_DIR / f"{key}.wav"
+    if p.exists():
+        return p.read_bytes()
+    tts = OpenAITextToSpeech(api_key=EMERGENT_LLM_KEY)
+    audio = await tts.generate_speech(
+        text=spoken, model="tts-1", voice=voice, response_format="wav"
+    )
+    p.write_bytes(audio)
+    return audio
+
+
+def _wav_to_mono_pcm(wav_bytes: bytes) -> tuple[np.ndarray, int]:
+    with wave.open(_io.BytesIO(wav_bytes), "rb") as w:
+        n = w.getnframes()
+        pcm = w.readframes(n)
+        rate = w.getframerate()
+        channels = w.getnchannels()
+        width = w.getsampwidth()
+    dtype = np.int16 if width == 2 else np.int8
+    arr = np.frombuffer(pcm, dtype=dtype)
+    if channels == 2:
+        arr = arr.reshape(-1, 2).mean(axis=1).astype(np.int16)
+    return arr.astype(np.int16), rate
+
+
+def _write_mono_wav(samples: np.ndarray, sample_rate: int) -> bytes:
+    buf = _io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(samples.astype(np.int16).tobytes())
+    return buf.getvalue()
+
+
+def _resample(arr: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if src_rate == dst_rate:
+        return arr
+    x_src = np.arange(len(arr))
+    ratio = dst_rate / src_rate
+    x_dst = np.arange(0, len(arr), 1.0 / ratio)
+    return np.interp(x_dst, x_src, arr).astype(np.int16)
+
+
+def _trim_onset(arr: np.ndarray, rate: int, thresh_ratio: float = 0.04,
+                pre_roll_ms: float = 4.0) -> np.ndarray:
+    """Drop leading silence so sample 0 is (almost exactly) the syllable onset."""
+    if len(arr) == 0:
+        return arr
+    mag = np.abs(arr.astype(np.int32))
+    peak = int(mag.max())
+    if peak == 0:
+        return arr
+    idx = int(np.argmax(mag > peak * thresh_ratio))
+    pre = int(rate * pre_roll_ms / 1000.0)
+    return arr[max(0, idx - pre):]
+
+
+def _prep_clip(arr: np.ndarray, rate: int, target_rate: int) -> np.ndarray:
+    """Resample, trim onset, peak-normalize. Returns float32 in [-1, 1]."""
+    arr = _resample(arr, rate, target_rate)
+    arr = _trim_onset(arr, target_rate)
+    f = arr.astype(np.float32)
+    peak = float(np.abs(f).max()) or 1.0
+    return (f / peak) * 0.8
+
+
+def _render_metronome(clips: dict, syllables: list, bpm: int, bars: int,
+                      beats_per_bar: int, sample_rate: int,
+                      duration_s: float) -> bytes:
+    """CPU-bound mixing. Run via asyncio.to_thread."""
+    seconds_per_beat = 60.0 / bpm
+    n_samples = int((duration_s + 0.6) * sample_rate)
+    out = np.zeros(n_samples, dtype=np.float32)
+
+    events = []
+    for bar in range(bars):
+        for syl, beat_offset in syllables:
+            t = (bar * beats_per_bar + beat_offset) * seconds_per_beat
+            events.append((syl, int(round(t * sample_rate))))
+    events.sort(key=lambda e: e[1])
+
+    fade = int(0.008 * sample_rate)  # 8 ms fade-out when a clip is cut short
+    for i, (syl, start) in enumerate(events):
+        if start >= n_samples:
+            continue
+        next_start = events[i + 1][1] if i + 1 < len(events) else n_samples
+        max_len = max(0, min(next_start, n_samples) - start)
+        clip = clips[syl]
+        if len(clip) > max_len:
+            clip = clip[:max_len].copy()
+            f = min(fade, len(clip))
+            if f > 0:
+                clip[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
+        out[start:start + len(clip)] += clip
+
+    out = np.clip(out, -1.0, 1.0)
+    return _write_mono_wav((out * 32767).astype(np.int16), sample_rate)
+
+
+class MetronomeRequest(BaseModel):
+    bpm: int = 90
+    pattern: str = "eighths"
+    bars: int = 2
+    voice: str = "onyx"
+
+
+@api_router.get("/metronome/patterns")
+async def metronome_patterns():
+    return {
+        "patterns": [
+            {"id": k, "label": v["label"], "beats_per_bar": v["beats_per_bar"]}
+            for k, v in RHYTHM_PATTERNS.items()
+        ]
+    }
+
+
+@api_router.post("/metronome")
+async def metronome_generate(
+    body: MetronomeRequest, authorization: Optional[str] = Header(None)
+):
+    user = await get_current_user(authorization)
+    bpm = max(40, min(220, int(body.bpm)))
+    bars = max(1, min(8, int(body.bars)))
+    pattern = RHYTHM_PATTERNS.get(body.pattern)
+    if not pattern:
+        raise HTTPException(status_code=400, detail="unknown_pattern")
+    # Respect user preference, but constrain to syllable-friendly voices.
+    stored_v, _, _ = await _resolve_user_voice(user.user_id)
+    requested = body.voice or stored_v
+    voice = requested if requested in ALLOWED_METRONOME_VOICES else "onyx"
+
+    cache_key = hashlib.sha256(
+        f"{bpm}|{body.pattern}|{bars}|{voice}|v3".encode()
+    ).hexdigest()
+    out_path = METRONOME_DIR / f"{cache_key}.wav"
+
+    beats_per_bar = pattern["beats_per_bar"]
+    total_beats = bars * beats_per_bar
+    duration_s = total_beats * (60.0 / bpm)
+
+    if not out_path.exists():
+        sample_rate = 24000  # OpenAI TTS native
+
+        # Network I/O stays async; fetch unique syllables concurrently.
+        unique_syls = sorted({s for s, _ in pattern["syllables_per_bar"]})
+        wavs = await asyncio.gather(
+            *[_get_syllable_wav(s, voice=voice) for s in unique_syls]
+        )
+
+        def _build() -> bytes:
+            clips: dict[str, np.ndarray] = {}
+            for s, wav in zip(unique_syls, wavs):
+                arr, rate = _wav_to_mono_pcm(wav)
+                clips[s] = _prep_clip(arr, rate, sample_rate)
+            return _render_metronome(
+                clips, pattern["syllables_per_bar"], bpm, bars,
+                beats_per_bar, sample_rate, duration_s,
+            )
+
+        data = await asyncio.to_thread(_build)
+        await asyncio.to_thread(out_path.write_bytes, data)
+
+    return {
+        "key": cache_key,
+        "ext": "wav",
+        "url": f"/api/metronome/{cache_key}.wav",
+        "bpm": bpm,
+        "bars": bars,
+        "pattern": body.pattern,
+        "beats_per_bar": beats_per_bar,
+        "total_beats": total_beats,
+        "duration_s": duration_s,
+    }
+
+
+@api_router.get("/metronome/{key}.wav")
+async def metronome_fetch(key: str):
+    p = METRONOME_DIR / f"{key}.wav"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="not_found")
+    return FileResponse(
+        p,
+        media_type="audio/wav",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 # =============================================================================
