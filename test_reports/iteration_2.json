@@ -1,0 +1,40 @@
+{
+  "summary": "RiffMaster backend re-tested for the new audio_base64/audio_mime fields on POST /api/chat/message. Added /app/backend/tests/test_chat_audio.py with 8 pytest cases. 8/8 passed when run serially (-n 0). Covered: (1) smoke — GET /api/lessons still returns 8 lessons; POST /api/chat/message text-only + image-only still return 200 with assistant text; (2) NEW audio: 2s 440Hz 16kHz mono 16-bit WAV → 200 with on-topic reply mentioning hearing/playing/sound; (3) Ogg/Opus bytes tagged as audio/webm (exercising backend webm→ogg mime normalization) → 200 with non-empty assistant text (no 'briefly offline'); (4) invalid base64 (not_base64_$$$$) → backend logs decode error, drops audio, still returns 200 with text-only assistant reply (verified in server logs: 'audio decode failed … binascii.Error'); (5) image_base64 + audio_base64 in the same message → 200 with non-empty assistant text; (6) /tmp/riff_audio_* cleanup — before/after count never grows (final count on disk: 0); (7) chat history after audio runs is clean — no _id, no user_id, every message has id/role/text/created_at. Note: when the suite is run with pytest-xdist's default 2 workers, test_wav_audio_round_trip can fail with the 'Riff hit a snag' fallback because the upstream LLM returns 429 concurrent_request_limit ('Unlock parallel requests by upgrading to Standard or Pro plan'). This is NOT an app bug — it is the Emergent LLM key's concurrency cap. Serial run is clean.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/chat/message", "issue": "Under concurrent requests (observed when pytest-xdist runs 2 workers), the upstream LLM returns 429 concurrent_request_limit and chat_message falls back to the generic 'Riff hit a snag analyzing that clip.' text. This masks a real upstream failure as a 200. Consider: (a) returning a 'degraded: true' flag or 503 when the LLM errors, or (b) differentiating fallback text for rate-limits vs decode errors so clients can retry."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_chat_audio.py",
+    "/app/backend/tests/test_riffmaster_api.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_audio.xml"
+  ],
+  "action_items": [
+    "Nothing blocking — audio pipeline (WAV, WebM→Ogg normalization, invalid-base64 tolerance, image+audio combo, tmp cleanup) all work end-to-end against real Gemini via EMERGENT_LLM_KEY.",
+    "Optional: surface upstream LLM 429/5xx distinctly from the audio-decode fallback (e.g. include a 'degraded' boolean in ChatMessageOut) so the client/tests can differentiate 'LLM rate-limited' from 'audio couldn't be understood'.",
+    "Optional: in pytest.ini, consider `-n 0` or marking chat tests `serial` to avoid flakiness from the LLM key's concurrent_request_limit when both tests hit chat/message at once."
+  ],
+  "critical_code_review_comments": [
+    "server.py chat_message: audio handling is clean — base64 decode is wrapped in try/except with logger.exception, mime→ext map covers all common formats, webm→ogg normalization is correct (both are Opus containers for Gemini), tmp files are cleaned in a finally block (confirmed empty on disk post-run).",
+    "The outer try/except around chat.stream_message swallows ALL LLM failures (including 429 rate-limits) and returns the same 'Riff hit a snag' text. This makes the 429 look identical to a Gemini audio-rejection to the client. Prior iteration review already flagged this; still relevant.",
+    "Audio supported mimes include 'audio/aiff' and 'audio/flac' in the ext_map but Gemini may not support all of these; worth adding a Gemini-supported-mime allowlist and a graceful 400 for unsupported mimes."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_chat_audio.py"
+  ],
+  "success_rate": {"backend": "100% (8/8 serial, test_chat_audio.py)", "frontend": "not_tested"},
+  "seed_data_creation": "Reused existing session-scoped fixture in conftest.py: inserts a TEST_ user doc + user_sessions row, cleans up users/user_sessions/progress/chat_messages on teardown. Audio fixtures generated at test time: WAV via Python's stdlib `wave` module (2s 440Hz 16kHz mono 16-bit PCM); Ogg Opus via `imageio-ffmpeg`'s bundled ffmpeg (`-f lavfi -i sine=... -c:a libopus -f ogg`). No fixture files committed.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Run audio tests serially: `pytest /app/backend/tests/test_chat_audio.py -v -n 0`. Running with pytest-xdist parallel workers can intermittently fail test_wav_audio_round_trip because the Emergent LLM key hits a 429 'concurrent_request_limit' — not an app bug. Fixtures auto-generate WAV & Ogg Opus (ffmpeg comes from `imageio-ffmpeg` pip pkg). Base URL is pinned to https://riff-mentor.preview.emergentagent.com in conftest/this file. Mongo bearer-injection fixture is in /app/backend/tests/conftest.py.",
+  "rca_of_issue": "User-reported bug 'camera/mic recordings never reach the agent' is FIXED on the backend side. Confirmed by sending a real 2s 16kHz sine WAV via POST /api/chat/message — Gemini responds on-topic (mentions hearing/sound/notes). Backend correctly: (1) decodes audio_base64, (2) writes to /tmp/riff_audio_<uuid>.<ext>, (3) attaches via FileContentWithMimeType with mime normalization (audio/webm→audio/ogg for Opus-in-WebM), (4) cleans tmp in finally. Error paths (bad base64) are tolerated — logged + 200 with text-only reply. Remaining user-facing work is on the frontend: the mobile client must actually capture the recorded audio blob, base64-encode it, and POST it under `audio_base64` + `audio_mime` fields (previously it was only running local pitch detection and never sending the audio). That is the main agent's remaining task to verify on the Expo side."
+}

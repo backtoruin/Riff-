@@ -14,8 +14,9 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta, date
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, TextDelta, StreamDone
+from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent, FileContentWithMimeType, TextDelta, StreamDone
 from emergentintegrations.llm.openai import OpenAITextToSpeech
+import base64 as b64lib
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -76,6 +77,8 @@ class User(BaseModel):
 class ChatMessageIn(BaseModel):
     text: str
     image_base64: Optional[str] = None  # Camera frame for vision analysis
+    audio_base64: Optional[str] = None  # Audio clip for hearing analysis
+    audio_mime: Optional[str] = None    # e.g., "audio/webm", "audio/m4a", "audio/wav"
     context: Optional[str] = None  # e.g. "live-audio-data" or "midi-notes"
 
 
@@ -601,16 +604,47 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
     prompt = body.text or ""
     if body.context:
         prompt = f"[Context: {body.context}]\n{prompt}"
-    file_contents = None
-    if body.image_base64:
-        file_contents = [ImageContent(image_base64=body.image_base64)]
-        if not prompt.strip():
-            prompt = "Here's a photo of me playing. What should I work on?"
 
-    um = UserMessage(text=prompt, file_contents=file_contents) if file_contents \
-        else UserMessage(text=prompt)
-
+    file_contents = []
+    tmp_files: list[Path] = []
     try:
+        if body.image_base64:
+            file_contents.append(ImageContent(image_base64=body.image_base64))
+            if not prompt.strip():
+                prompt = "Here's a photo of me playing. What should I work on?"
+        if body.audio_base64:
+            mime = (body.audio_mime or "audio/mp4").split(";")[0].strip().lower()
+            ext_map = {
+                "audio/mpeg": "mp3", "audio/mp3": "mp3",
+                "audio/mp4": "m4a", "audio/m4a": "m4a", "audio/x-m4a": "m4a",
+                "audio/wav": "wav", "audio/x-wav": "wav",
+                "audio/ogg": "ogg", "audio/webm": "webm",
+                "audio/aac": "aac", "audio/flac": "flac", "audio/aiff": "aiff",
+            }
+            ext = ext_map.get(mime, "bin")
+            # Normalize webm/opus → ogg for Gemini compatibility (both are Opus containers)
+            send_mime = mime
+            if mime == "audio/webm":
+                send_mime = "audio/ogg"
+            try:
+                audio_bytes = b64lib.b64decode(body.audio_base64)
+                tmp = Path(f"/tmp/riff_audio_{uuid.uuid4().hex}.{ext}")
+                tmp.write_bytes(audio_bytes)
+                tmp_files.append(tmp)
+                file_contents.append(
+                    FileContentWithMimeType(file_path=str(tmp), mime_type=send_mime)
+                )
+                if not prompt.strip():
+                    prompt = "Listen to this clip of me playing and tell me what to work on."
+            except Exception:
+                logger.exception("audio decode failed")
+
+        um = (
+            UserMessage(text=prompt, file_contents=file_contents)
+            if file_contents
+            else UserMessage(text=prompt)
+        )
+
         chunks = []
         async for ev in chat.stream_message(um):
             if isinstance(ev, TextDelta):
@@ -618,9 +652,15 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
             elif isinstance(ev, StreamDone):
                 break
         reply_text = "".join(chunks).strip() or "Hmm, I didn't catch that — try again?"
-    except Exception as e:
+    except Exception:
         logger.exception("LLM failed")
-        reply_text = f"(Riff is briefly offline — mic check, mic check. Try again in a moment.)"
+        reply_text = "(Riff hit a snag analyzing that clip. Try one more time?)"
+    finally:
+        for t in tmp_files:
+            try:
+                t.unlink()
+            except Exception:
+                pass
 
     assistant_msg = {
         "id": str(uuid.uuid4()),

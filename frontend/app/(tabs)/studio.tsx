@@ -14,7 +14,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as Haptics from "expo-haptics";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as ImageManipulator from "expo-image-manipulator";
-import { Camera, Mic, Send, Volume2, Keyboard as KeyboardIcon } from "lucide-react-native";
+import { useAudioRecorder, RecordingPresets } from "expo-audio";
+import {
+  Camera,
+  Mic,
+  Send,
+  Volume2,
+  CircleDot,
+  Image as ImageIcon,
+  Loader2,
+} from "lucide-react-native";
 
 import { apiFetch, BACKEND_URL, getToken } from "@/src/api/client";
 import { useTheme, makeStyles, spacing, radius } from "@/src/theme";
@@ -23,9 +32,8 @@ import { ChatBubble, ChatMessage } from "@/src/components/ChatBubble";
 import { PitchMeter } from "@/src/components/PitchMeter";
 import { startPitchDetection, PitchState } from "@/src/lib/pitch";
 import { startMidi, MidiState } from "@/src/lib/midi";
+import { recordWebClip, recordNativeClip } from "@/src/lib/record";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
-
-type Progress = { streak_days: number; level: number };
 
 const useStyles = makeStyles((colors) => ({
   root: { flex: 1, backgroundColor: colors.surface },
@@ -40,12 +48,8 @@ const useStyles = makeStyles((colors) => ({
   headerStack: { flex: 1 },
   kicker: { color: colors.muted, fontSize: 11, letterSpacing: 1.5, fontWeight: "600" },
   title: { color: colors.onSurface, fontSize: 22, fontWeight: "500", letterSpacing: 0.3 },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: colors.success,
-  },
+  statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.success },
+
   gear: {
     flexDirection: "row",
     gap: spacing.sm,
@@ -68,34 +72,32 @@ const useStyles = makeStyles((colors) => ({
   gearTxt: { color: colors.onSurfaceTertiary, fontSize: 11, fontWeight: "700", letterSpacing: 0.8 },
   gearTxtActive: { color: colors.brand },
 
-  cameraWrap: {
+  // CAMERA panel
+  camPanel: {
     marginHorizontal: spacing.lg,
-    marginBottom: spacing.sm,
-    height: 180,
-    borderRadius: radius.lg,
-    overflow: "hidden",
+    marginBottom: spacing.md,
     backgroundColor: colors.surfaceSecondary,
     borderWidth: 1,
     borderColor: colors.border,
-    position: "relative",
+    borderRadius: radius.lg,
+    overflow: "hidden",
   },
-  cameraPlaceholder: {
+  camPreview: {
+    height: 170,
+    position: "relative",
+    backgroundColor: colors.surfaceTertiary,
+  },
+  camPlaceholder: {
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
     gap: 6,
   },
-  cameraPlaceholderTxt: { color: colors.muted, fontSize: 12 },
-  cameraOverlay: {
+  camPlaceholderTxt: { color: colors.muted, fontSize: 12 },
+  liveTag: {
     position: "absolute",
+    top: 8,
     left: 8,
-    right: 8,
-    bottom: 8,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  recDot: {
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
@@ -104,18 +106,59 @@ const useStyles = makeStyles((colors) => ({
     paddingHorizontal: spacing.sm,
     borderRadius: radius.pill,
   },
-  recDotBubble: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.error },
-  recTxt: { color: colors.onSurface, fontSize: 10, fontWeight: "700", letterSpacing: 1 },
-  critique: {
-    backgroundColor: colors.brandPrimary,
-    paddingVertical: 6,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radius.pill,
+  liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.error },
+  liveTxt: { color: colors.onSurface, fontSize: 10, fontWeight: "700", letterSpacing: 1 },
+
+  // LISTEN panel
+  listenPanel: {
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.md,
+    gap: spacing.sm,
   },
-  critiqueTxt: { color: colors.onBrandPrimary, fontSize: 11, fontWeight: "700", letterSpacing: 0.5 },
 
-  pitchWrap: { paddingHorizontal: spacing.lg, paddingBottom: spacing.sm },
+  // Big primary action
+  primaryBtn: {
+    backgroundColor: colors.brandPrimary,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+  },
+  primaryBtnDisabled: { opacity: 0.6 },
+  primaryTxt: {
+    color: colors.onBrandPrimary,
+    fontWeight: "700",
+    letterSpacing: 1,
+    fontSize: 13,
+  },
 
+  // RECORD BUTTON for audio
+  recBtn: {
+    backgroundColor: colors.brandPrimary,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
+    borderRadius: radius.pill,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    borderWidth: 2,
+    borderColor: colors.brandPrimary,
+  },
+  recBtnRecording: {
+    backgroundColor: colors.error,
+    borderColor: colors.error,
+  },
+  recTxt: {
+    color: colors.onBrandPrimary,
+    fontWeight: "700",
+    letterSpacing: 1,
+    fontSize: 13,
+  },
+
+  // MIDI panel
   midiPanel: {
     marginHorizontal: spacing.lg,
     marginBottom: spacing.sm,
@@ -125,7 +168,13 @@ const useStyles = makeStyles((colors) => ({
     borderColor: colors.border,
     borderRadius: radius.lg,
   },
-  midiLabel: { color: colors.muted, fontSize: 11, letterSpacing: 1.5, fontWeight: "600", marginBottom: spacing.xs },
+  midiLabel: {
+    color: colors.muted,
+    fontSize: 11,
+    letterSpacing: 1.5,
+    fontWeight: "600",
+    marginBottom: spacing.xs,
+  },
   midiRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   midiPill: {
     paddingVertical: 4,
@@ -136,9 +185,26 @@ const useStyles = makeStyles((colors) => ({
   midiPillTxt: { color: colors.onSurfaceSecondary, fontSize: 12, fontWeight: "600" },
   midiEmpty: { color: colors.muted, fontSize: 12, fontStyle: "italic" },
 
+  // Chat
   chat: { flex: 1 },
   chatContent: { paddingVertical: spacing.md, gap: 0 },
 
+  // Thinking indicator
+  thinkingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.sm,
+  },
+  thinkingTxt: {
+    color: colors.brand,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 1,
+  },
+
+  // Input
   inputBar: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -170,7 +236,7 @@ const useStyles = makeStyles((colors) => ({
     alignItems: "center",
     justifyContent: "center",
   },
-  listenBtn: {
+  listenHintBtn: {
     marginLeft: 4,
     marginTop: 4,
     flexDirection: "row",
@@ -184,7 +250,7 @@ const WELCOME: ChatMessage = {
   id: "welcome",
   role: "assistant",
   text:
-    "Hey — I'm Riff. Pop on the camera and I'll check your posture, or just play something and I'll tell you what to fix. What are we working on today?",
+    "Hey — I'm Riff. Flip on CAMERA and tap SNAP PHOTO so I can see your technique, or hit LISTEN and tap RECORD so I can hear you play. What are we working on today?",
 };
 
 export default function StudioTab() {
@@ -197,10 +263,18 @@ export default function StudioTab() {
   const [messages, setMessages] = useState<ChatMessage[]>([WELCOME]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [thinkingLabel, setThinkingLabel] = useState<string | null>(null);
   const [cameraOn, setCameraOn] = useState(false);
   const [listening, setListening] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recCountdown, setRecCountdown] = useState(0);
   const [midi, setMidi] = useState<MidiState>({ supported: false, devices: [], events: [] });
-  const [pitch, setPitch] = useState<PitchState>({ frequency: null, note: null, cents: 0, rms: 0 });
+  const [pitch, setPitch] = useState<PitchState>({
+    frequency: null,
+    note: null,
+    cents: 0,
+    rms: 0,
+  });
 
   const cameraRef = useRef<CameraView | null>(null);
   const [permission, requestPermission] = useCameraPermissions();
@@ -210,6 +284,13 @@ export default function StudioTab() {
   const midiStopRef = useRef<null | (() => void)>(null);
   const audioPlayerRef = useRef<any>(null);
   const sessionLogged = useRef(false);
+
+  // Native recorder (ignored on web)
+  const nativeRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+
+  // Pitch sample history for context
+  const pitchSamplesRef = useRef<{ t: number; note: string }[]>([]);
+  const pitchT0Ref = useRef<number>(0);
 
   // Load prior chat history
   const historyQ = useQuery({
@@ -223,6 +304,19 @@ export default function StudioTab() {
   }, [historyQ.data?.messages]);
 
   // Pitch + MIDI start/stop
+  const onPitchUpdate = useCallback((s: PitchState) => {
+    setPitch(s);
+    if (s.note) {
+      const t = (Date.now() - pitchT0Ref.current) / 1000;
+      const arr = pitchSamplesRef.current;
+      const last = arr[arr.length - 1];
+      if (!last || last.note !== s.note) {
+        arr.push({ t: Math.round(t * 10) / 10, note: s.note });
+        if (arr.length > 60) arr.shift();
+      }
+    }
+  }, []);
+
   const toggleListening = useCallback(async () => {
     if (listening) {
       pitchStopRef.current?.();
@@ -231,12 +325,15 @@ export default function StudioTab() {
       midiStopRef.current = null;
       setListening(false);
       setPitch({ frequency: null, note: null, cents: 0, rms: 0 });
+      pitchSamplesRef.current = [];
       return;
     }
     setListening(true);
-    pitchStopRef.current = await startPitchDetection(setPitch);
+    pitchT0Ref.current = Date.now();
+    pitchSamplesRef.current = [];
+    pitchStopRef.current = await startPitchDetection(onPitchUpdate);
     midiStopRef.current = await startMidi(setMidi);
-  }, [listening]);
+  }, [listening, onPitchUpdate]);
 
   useEffect(() => {
     return () => {
@@ -274,7 +371,9 @@ export default function StudioTab() {
   }, [cameraOn, permission, requestPermission]);
 
   const scrollToEnd = () => {
-    requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    requestAnimationFrame(() =>
+      scrollRef.current?.scrollToEnd({ animated: true }),
+    );
   };
 
   const playTTS = useCallback(async (text: string) => {
@@ -297,10 +396,16 @@ export default function StudioTab() {
       } else {
         const { createAudioPlayer, setAudioModeAsync } = await import("expo-audio");
         try {
-          await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: false } as any);
+          await setAudioModeAsync({
+            playsInSilentMode: true,
+            allowsRecording: false,
+          } as any);
         } catch {}
         if (audioPlayerRef.current) {
-          try { audioPlayerRef.current.pause?.(); audioPlayerRef.current.remove?.(); } catch {}
+          try {
+            audioPlayerRef.current.pause?.();
+            audioPlayerRef.current.remove?.();
+          } catch {}
         }
         const player = createAudioPlayer({ uri: audioUrl });
         audioPlayerRef.current = player;
@@ -310,90 +415,221 @@ export default function StudioTab() {
   }, []);
 
   const sendMessageMut = useMutation({
-    mutationFn: async (payload: { text: string; image_base64?: string; context?: string }) => {
+    mutationFn: async (payload: {
+      text: string;
+      image_base64?: string;
+      audio_base64?: string;
+      audio_mime?: string;
+      context?: string;
+    }) => {
       return apiFetch<{ id: string; role: "assistant"; text: string }>(
         "/api/chat/message",
         { method: "POST", body: JSON.stringify(payload) },
       );
     },
     onSuccess: (reply) => {
-      setMessages((m) => [...m, { id: reply.id, role: "assistant", text: reply.text }]);
+      setMessages((m) => [
+        ...m,
+        { id: reply.id, role: "assistant", text: reply.text },
+      ]);
       scrollToEnd();
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => {},
+      );
       void playTTS(reply.text);
       qc.invalidateQueries({ queryKey: ["progress"] });
     },
   });
 
+  const buildAudioContext = useCallback(() => {
+    const samples = pitchSamplesRef.current.slice(-30);
+    if (samples.length === 0) return "";
+    const timeline = samples
+      .map((s) => `${s.t.toFixed(1)}s:${s.note}`)
+      .join(" → ");
+    return `Detected pitch timeline during the clip: ${timeline}.`;
+  }, []);
+
   const captureAndCritique = useCallback(async () => {
-    if (!cameraRef.current || !cameraOn) {
-      await toggleCamera();
-      return;
-    }
+    if (!cameraOn || !cameraRef.current) return;
     try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+      setThinkingLabel("Riff is looking at your photo…");
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.5,
+        quality: 0.6,
         base64: false,
         skipProcessing: true,
       });
-      if (!photo?.uri) return;
+      if (!photo?.uri) {
+        setThinkingLabel(null);
+        return;
+      }
       const resized = await ImageManipulator.manipulateAsync(
         photo.uri,
         [{ resize: { width: 720 } }],
-        { compress: 0.65, format: ImageManipulator.SaveFormat.JPEG, base64: true },
+        {
+          compress: 0.65,
+          format: ImageManipulator.SaveFormat.JPEG,
+          base64: true,
+        },
       );
-      if (!resized.base64) return;
-
-      // Compose context from live state
-      let context = "The student is in a live practice session.";
-      if (pitch.note) context += ` Current detected pitch: ${pitch.note} (${pitch.frequency?.toFixed(1)} Hz).`;
-      if (midi.events.length) {
-        const recent = midi.events.slice(0, 5).map((e) => e.name).join(", ");
-        context += ` Recent MIDI notes: ${recent}.`;
+      if (!resized.base64) {
+        setThinkingLabel(null);
+        return;
       }
+
+      let context = "The student just snapped a photo during a live practice session.";
+      if (pitch.note) context += ` Current pitch: ${pitch.note}.`;
+      if (midi.events.length)
+        context += ` Recent MIDI notes: ${midi.events
+          .slice(0, 5)
+          .map((e) => e.name)
+          .join(", ")}.`;
 
       const userMsg: ChatMessage = {
         id: `u-${Date.now()}`,
         role: "user",
-        text: "📸 Please analyze my technique.",
+        text: "📸 Here's a snapshot — what should I fix?",
       };
       setMessages((m) => [...m, userMsg]);
       scrollToEnd();
       setSending(true);
       await sendMessageMut.mutateAsync({
-        text: "Please analyze my technique from this photo. Focus on 1-2 specific things.",
+        text: "Please analyze my technique from this photo. Focus on 1-2 specific things to improve.",
         image_base64: resized.base64,
         context,
       });
-    } catch {
+    } catch (e) {
+      setMessages((m) => [
+        ...m,
+        {
+          id: `s-${Date.now()}`,
+          role: "assistant",
+          text: "Couldn't capture that one — try again?",
+        },
+      ]);
     } finally {
+      setThinkingLabel(null);
       setSending(false);
     }
-  }, [cameraOn, toggleCamera, pitch, midi, sendMessageMut]);
+  }, [cameraOn, pitch, midi, sendMessageMut]);
+
+  const recordAndSend = useCallback(async () => {
+    if (recording) return;
+    setRecording(true);
+    const SECS = 6;
+    setRecCountdown(SECS);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+    pitchT0Ref.current = Date.now();
+    pitchSamplesRef.current = [];
+
+    // Live countdown
+    const tickInterval = setInterval(() => {
+      setRecCountdown((n) => (n > 0 ? n - 1 : 0));
+    }, 1000);
+
+    const userMsg: ChatMessage = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      text: `🎙️ Recording ${SECS}s for Riff — play now!`,
+    };
+    setMessages((m) => [...m, userMsg]);
+    scrollToEnd();
+
+    let clip =
+      Platform.OS === "web"
+        ? await recordWebClip(SECS)
+        : await recordNativeClip(nativeRecorder, SECS);
+
+    clearInterval(tickInterval);
+    setRecCountdown(0);
+    setRecording(false);
+
+    if (!clip || !clip.base64) {
+      setMessages((m) => [
+        ...m,
+        {
+          id: `s-${Date.now()}`,
+          role: "assistant",
+          text:
+            "Hmm — I couldn't capture any audio. Check that your browser/app has mic permission and try again.",
+        },
+      ]);
+      return;
+    }
+
+    const timelineCtx = buildAudioContext();
+    let context = `Student recorded ~${SECS}s of guitar audio (${clip.mime}, ${Math.round(
+      clip.bytes / 1024,
+    )} KB).`;
+    if (timelineCtx) context += " " + timelineCtx;
+    if (midi.events.length) {
+      context +=
+        " MIDI notes played: " +
+        midi.events
+          .slice(0, 10)
+          .reverse()
+          .map((e) => e.name)
+          .join(" → ");
+    }
+
+    setThinkingLabel("Riff is listening to your clip…");
+    setSending(true);
+    try {
+      await sendMessageMut.mutateAsync({
+        text: "I just recorded a short clip of me playing. Please listen and tell me what to work on — timing, pitch, tone, feel.",
+        audio_base64: clip.base64,
+        audio_mime: clip.mime,
+        context,
+      });
+    } finally {
+      setThinkingLabel(null);
+      setSending(false);
+    }
+  }, [recording, nativeRecorder, midi, buildAudioContext, sendMessageMut]);
 
   const sendText = useCallback(async () => {
     const txt = input.trim();
     if (!txt || sending) return;
-    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: "user", text: txt };
+    const userMsg: ChatMessage = {
+      id: `u-${Date.now()}`,
+      role: "user",
+      text: txt,
+    };
     setMessages((m) => [...m, userMsg]);
     setInput("");
     scrollToEnd();
     setSending(true);
+    setThinkingLabel("Riff is thinking…");
 
     let context = "";
     if (listening) {
-      if (pitch.note) context = `Live pitch: ${pitch.note} (${pitch.frequency?.toFixed(1)} Hz).`;
+      if (pitch.note)
+        context = `Live pitch: ${pitch.note} (${pitch.frequency?.toFixed(1)} Hz).`;
       if (midi.events.length) {
-        const recent = midi.events.slice(0, 5).map((e) => e.name).join(", ");
-        context += ` Recent MIDI: ${recent}.`;
+        context +=
+          " Recent MIDI: " +
+          midi.events
+            .slice(0, 5)
+            .map((e) => e.name)
+            .join(", ") +
+          ".";
       }
     }
     try {
-      await sendMessageMut.mutateAsync({ text: txt, context: context || undefined });
+      await sendMessageMut.mutateAsync({
+        text: txt,
+        context: context || undefined,
+      });
     } finally {
       setSending(false);
+      setThinkingLabel(null);
     }
   }, [input, sending, listening, pitch, midi, sendMessageMut]);
+
+  const recBtnLabel = recording
+    ? `RECORDING… ${recCountdown}s`
+    : "RECORD 6s FOR RIFF";
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]} testID="studio-screen">
@@ -417,48 +653,66 @@ export default function StudioTab() {
             onPress={toggleCamera}
             style={[styles.gearBtn, cameraOn && styles.gearBtnActive]}
           >
-            <Camera size={14} color={cameraOn ? colors.brand : colors.onSurfaceTertiary} />
-            <Text style={[styles.gearTxt, cameraOn && styles.gearTxtActive]}>CAMERA</Text>
+            <Camera
+              size={14}
+              color={cameraOn ? colors.brand : colors.onSurfaceTertiary}
+            />
+            <Text style={[styles.gearTxt, cameraOn && styles.gearTxtActive]}>
+              CAMERA
+            </Text>
           </Pressable>
           <Pressable
             testID="studio-toggle-listen"
             onPress={toggleListening}
             style={[styles.gearBtn, listening && styles.gearBtnActive]}
           >
-            <Mic size={14} color={listening ? colors.brand : colors.onSurfaceTertiary} />
-            <Text style={[styles.gearTxt, listening && styles.gearTxtActive]}>LISTEN</Text>
+            <Mic
+              size={14}
+              color={listening ? colors.brand : colors.onSurfaceTertiary}
+            />
+            <Text style={[styles.gearTxt, listening && styles.gearTxtActive]}>
+              LISTEN
+            </Text>
           </Pressable>
         </View>
 
         {cameraOn && (
-          <View style={styles.cameraWrap} testID="studio-camera-preview">
-            {permission?.granted ? (
-              <CameraView ref={cameraRef as any} style={{ flex: 1 }} facing="front" />
-            ) : (
-              <View style={styles.cameraPlaceholder}>
-                <Text style={styles.cameraPlaceholderTxt}>
-                  Camera permission needed
-                </Text>
+          <View style={styles.camPanel} testID="studio-camera-panel">
+            <View style={styles.camPreview}>
+              {permission?.granted ? (
+                <CameraView
+                  ref={cameraRef as any}
+                  style={{ flex: 1 }}
+                  facing="front"
+                />
+              ) : (
+                <View style={styles.camPlaceholder}>
+                  <Text style={styles.camPlaceholderTxt}>
+                    Camera permission needed
+                  </Text>
+                </View>
+              )}
+              <View style={styles.liveTag}>
+                <View style={styles.liveDot} />
+                <Text style={styles.liveTxt}>LIVE</Text>
               </View>
-            )}
-            <View style={styles.cameraOverlay}>
-              <View style={styles.recDot}>
-                <View style={styles.recDotBubble} />
-                <Text style={styles.recTxt}>LIVE</Text>
-              </View>
-              <Pressable
-                testID="studio-critique-button"
-                onPress={captureAndCritique}
-                style={styles.critique}
-              >
-                <Text style={styles.critiqueTxt}>ANALYZE MY TECHNIQUE</Text>
-              </Pressable>
             </View>
+            <Pressable
+              testID="studio-snap-photo-button"
+              onPress={captureAndCritique}
+              disabled={sending}
+              style={[styles.primaryBtn, sending && styles.primaryBtnDisabled]}
+            >
+              <ImageIcon size={16} color={colors.onBrandPrimary} />
+              <Text style={styles.primaryTxt}>
+                {sending ? "SENDING TO RIFF…" : "SNAP PHOTO & SEND TO RIFF"}
+              </Text>
+            </Pressable>
           </View>
         )}
 
         {listening && (
-          <View style={styles.pitchWrap}>
+          <View style={styles.listenPanel}>
             <PitchMeter
               note={pitch.note}
               frequency={pitch.frequency}
@@ -466,22 +720,41 @@ export default function StudioTab() {
               rms={pitch.rms}
               listening
             />
+            <Pressable
+              testID="studio-record-button"
+              onPress={recordAndSend}
+              disabled={recording || sending}
+              style={[styles.recBtn, recording && styles.recBtnRecording]}
+            >
+              <CircleDot
+                size={16}
+                color={colors.onBrandPrimary}
+                fill={colors.onBrandPrimary}
+              />
+              <Text style={styles.recTxt}>{recBtnLabel}</Text>
+            </Pressable>
           </View>
         )}
 
         {midi.supported && (
           <View style={styles.midiPanel} testID="studio-midi-panel">
             <Text style={styles.midiLabel}>
-              MIDI {midi.devices.length ? `· ${midi.devices.join(", ")}` : "· waiting for device"}
+              MIDI{" "}
+              {midi.devices.length
+                ? `· ${midi.devices.join(", ")}`
+                : "· waiting for device"}
             </Text>
             {midi.events.length === 0 ? (
-              <Text style={styles.midiEmpty}>Play any note on a connected MIDI device…</Text>
+              <Text style={styles.midiEmpty}>
+                Play any note on a connected MIDI device…
+              </Text>
             ) : (
               <View style={styles.midiRow}>
                 {midi.events.slice(0, 10).map((e) => (
                   <View key={e.id} style={styles.midiPill}>
                     <Text style={styles.midiPillTxt}>
-                      {e.type === "on" ? "" : "·"}{e.name}
+                      {e.type === "on" ? "" : "·"}
+                      {e.name}
                     </Text>
                   </View>
                 ))}
@@ -504,7 +777,10 @@ export default function StudioTab() {
                 <Pressable
                   testID={`speak-${m.id}`}
                   onPress={() => playTTS(m.text)}
-                  style={[styles.listenBtn, { paddingLeft: spacing.lg + spacing.md }]}
+                  style={[
+                    styles.listenHintBtn,
+                    { paddingLeft: spacing.lg + spacing.md },
+                  ]}
                 >
                   <Volume2 size={13} color={colors.brand} />
                   <Text style={styles.listenTxt}>HEAR RIFF SAY IT</Text>
@@ -512,14 +788,23 @@ export default function StudioTab() {
               )}
             </View>
           ))}
-          {sendMessageMut.isPending && (
-            <View style={{ paddingHorizontal: spacing.lg, paddingTop: spacing.sm }}>
+          {thinkingLabel && (
+            <View style={styles.thinkingRow}>
               <ActivityIndicator color={colors.brand} />
+              <Text style={styles.thinkingTxt}>{thinkingLabel.toUpperCase()}</Text>
             </View>
           )}
         </ScrollView>
 
-        <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, spacing.sm) + tabBarHeight + spacing.sm }]}>
+        <View
+          style={[
+            styles.inputBar,
+            {
+              paddingBottom:
+                Math.max(insets.bottom, spacing.sm) + tabBarHeight + spacing.sm,
+            },
+          ]}
+        >
           <TextInput
             testID="studio-text-input"
             style={styles.input}
@@ -535,7 +820,10 @@ export default function StudioTab() {
             testID="studio-send-button"
             disabled={sending || !input.trim()}
             onPress={sendText}
-            style={[styles.send, (sending || !input.trim()) && { opacity: 0.5 }]}
+            style={[
+              styles.send,
+              (sending || !input.trim()) && { opacity: 0.5 },
+            ]}
           >
             <Send size={18} color={colors.onBrandPrimary} />
           </Pressable>
