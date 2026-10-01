@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Header, HTTPException, Response
+from fastapi import FastAPI, APIRouter, Header, HTTPException, Response, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -598,6 +598,78 @@ async def chat_history(authorization: Optional[str] = Header(None)):
     return {"messages": msgs}
 
 
+async def _stream_with_retry(chat: LlmChat, um: UserMessage) -> str:
+    """Stream a Gemini reply with retries; returns reply text or a friendly error message."""
+    # Gemini via Vertex occasionally returns UNAVAILABLE / APIConnectionError
+    # under load. Retry with exponential backoff before falling back.
+    last_err: Optional[Exception] = None
+    reply_text = ""
+    for attempt in range(3):
+        try:
+            chunks = []
+            async for ev in chat.stream_message(um):
+                if isinstance(ev, TextDelta):
+                    chunks.append(ev.content)
+                elif isinstance(ev, StreamDone):
+                    break
+            reply_text = "".join(chunks).strip()
+            if reply_text:
+                last_err = None
+                break
+            last_err = RuntimeError("empty_reply")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "LLM attempt %d failed: %s", attempt + 1, repr(e)[:200],
+            )
+        if attempt < 2:
+            await asyncio.sleep(1.0 * (2 ** attempt))  # 1s, then 2s
+
+    if not reply_text:
+        # Give the user a precise reason so they know whether to retry.
+        msg = repr(last_err) if last_err else ""
+        lower = msg.lower()
+        if "unavailable" in lower or "high demand" in lower or "503" in msg:
+            reply_text = (
+                "Gemini is slammed with traffic right now — give it 10 seconds and tap send again."
+            )
+        elif ("rate" in lower and "limit" in lower) or "429" in msg:
+            reply_text = (
+                "Hit a short rate limit. Try again in a few seconds."
+            )
+        elif "safety" in lower or "blocked" in lower:
+            reply_text = (
+                "That one got blocked by a safety filter. Try renaming the file or uploading a different clip."
+            )
+        elif "timeout" in lower:
+            reply_text = (
+                "That clip took too long to analyze — try a shorter one (under 60s)."
+            )
+        else:
+            reply_text = (
+                "Riff couldn't analyze that one. Try again — if it keeps failing, upload a shorter clip."
+            )
+        logger.exception("LLM failed after retries")
+    return reply_text
+
+
+async def _store_assistant_reply(user, reply_text: str) -> ChatMessageOut:
+    assistant_msg = {
+        "id": str(uuid.uuid4()),
+        "user_id": user.user_id,
+        "role": "assistant",
+        "text": reply_text,
+        "created_at": datetime.now(timezone.utc),
+    }
+    await db.chat_messages.insert_one(assistant_msg)
+    return ChatMessageOut(
+        id=assistant_msg["id"],
+        role="assistant",
+        text=reply_text,
+        created_at=assistant_msg["created_at"].isoformat(),
+    )
+
+
 @api_router.post("/chat/message", response_model=ChatMessageOut)
 async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Header(None)):
     user = await get_current_user(authorization)
@@ -687,56 +759,7 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
             else UserMessage(text=prompt)
         )
 
-        # Gemini via Vertex occasionally returns UNAVAILABLE / APIConnectionError
-        # under load. Retry with exponential backoff before falling back.
-        last_err: Optional[Exception] = None
-        reply_text = ""
-        for attempt in range(3):
-            try:
-                chunks = []
-                async for ev in chat.stream_message(um):
-                    if isinstance(ev, TextDelta):
-                        chunks.append(ev.content)
-                    elif isinstance(ev, StreamDone):
-                        break
-                reply_text = "".join(chunks).strip()
-                if reply_text:
-                    last_err = None
-                    break
-                last_err = RuntimeError("empty_reply")
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                logger.warning(
-                    "LLM attempt %d failed: %s", attempt + 1, repr(e)[:200],
-                )
-            if attempt < 2:
-                await asyncio.sleep(1.0 * (2 ** attempt))  # 1s, then 2s
-
-        if not reply_text:
-            # Give the user a precise reason so they know whether to retry.
-            msg = repr(last_err) if last_err else ""
-            lower = msg.lower()
-            if "unavailable" in lower or "high demand" in lower or "503" in msg:
-                reply_text = (
-                    "Gemini is slammed with traffic right now — give it 10 seconds and tap send again."
-                )
-            elif ("rate" in lower and "limit" in lower) or "429" in msg:
-                reply_text = (
-                    "Hit a short rate limit. Try again in a few seconds."
-                )
-            elif "safety" in lower or "blocked" in lower:
-                reply_text = (
-                    "That one got blocked by a safety filter. Try renaming the file or uploading a different clip."
-                )
-            elif "timeout" in lower:
-                reply_text = (
-                    "That clip took too long to analyze — try a shorter one (under 60s)."
-                )
-            else:
-                reply_text = (
-                    "Riff couldn't analyze that one. Try again — if it keeps failing, upload a shorter clip."
-                )
-            logger.exception("LLM failed after retries")
+        reply_text = await _stream_with_retry(chat, um)
     except Exception:
         logger.exception("chat_message assembly failed")
         if not reply_text:
@@ -748,21 +771,136 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
             except Exception:
                 pass
 
-    assistant_msg = {
+    return await _store_assistant_reply(user, reply_text)
+
+
+# ---- Large audio/video upload (multipart, streamed to disk) -----------------
+# The JSON /chat/message route base64-encodes files into the request body, which
+# is fine for short recordings but not for big clips. This route accepts a
+# multipart upload and never holds the whole file in memory.
+MAX_UPLOAD_MB = 500
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+_UPLOAD_AUDIO = {
+    "audio/mpeg": "mp3", "audio/mp3": "mp3",
+    "audio/mp4": "m4a", "audio/m4a": "m4a", "audio/x-m4a": "m4a",
+    "audio/wav": "wav", "audio/x-wav": "wav",
+    "audio/ogg": "ogg", "audio/webm": "webm",
+    "audio/aac": "aac", "audio/flac": "flac",
+    "audio/aiff": "aiff", "audio/x-aiff": "aiff",
+}
+_UPLOAD_VIDEO = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/mov": "mov",
+    "video/x-m4v": "m4v", "video/webm": "webm", "video/3gpp": "3gp",
+    "video/x-matroska": "mkv", "video/x-msvideo": "avi",
+}
+# Used when the client sends application/octet-stream or no type at all.
+_UPLOAD_EXT_TO_MIME = {
+    "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav", "aac": "audio/aac",
+    "ogg": "audio/ogg", "flac": "audio/flac", "aif": "audio/aiff", "aiff": "audio/aiff",
+    "mp4": "video/mp4", "mov": "video/quicktime", "m4v": "video/x-m4v",
+    "webm": "video/webm", "3gp": "video/3gpp", "mkv": "video/x-matroska",
+    "avi": "video/x-msvideo",
+}
+
+
+def _resolve_upload_mime(content_type: Optional[str], filename: str) -> Optional[str]:
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if mime in _UPLOAD_AUDIO or mime in _UPLOAD_VIDEO:
+        return mime
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _UPLOAD_EXT_TO_MIME.get(ext)
+
+
+@api_router.post("/chat/upload", response_model=ChatMessageOut)
+async def chat_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    text: str = Form(""),
+    context: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
+):
+    user = await get_current_user(authorization)
+
+    too_large = HTTPException(
+        status_code=413,
+        detail=f"File is larger than {MAX_UPLOAD_MB} MB.",
+    )
+    # Reject early when the client declares a size (small allowance for form overhead).
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES + 1024 * 1024:
+        raise too_large
+
+    filename = file.filename or "upload"
+    mime = _resolve_upload_mime(file.content_type, filename)
+    if not mime:
+        raise HTTPException(status_code=415, detail="Unsupported file type.")
+    is_video = mime in _UPLOAD_VIDEO
+    ext = (_UPLOAD_VIDEO if is_video else _UPLOAD_AUDIO)[mime]
+
+    tmp = Path(f"/tmp/riff_{'video' if is_video else 'audio'}_{uuid.uuid4().hex}.{ext}")
+    total = 0
+    try:
+        with tmp.open("wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise too_large
+                out.write(chunk)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    if total == 0:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Empty file.")
+
+    now = datetime.now(timezone.utc)
+    prompt = text or ""
+    if context:
+        prompt = f"[Context: {context}]\n{prompt}"
+    if not prompt.strip():
+        prompt = (
+            "Please watch this video of me playing and critique my technique and timing."
+            if is_video
+            else "Listen to this clip of me playing and tell me what to work on."
+        )
+    await db.chat_messages.insert_one({
         "id": str(uuid.uuid4()),
         "user_id": user.user_id,
-        "role": "assistant",
-        "text": reply_text,
-        "created_at": datetime.now(timezone.utc),
-    }
-    await db.chat_messages.insert_one(assistant_msg)
+        "role": "user",
+        "text": text,
+        "has_image": False,
+        "context": context,
+        "created_at": now,
+    })
 
-    return ChatMessageOut(
-        id=assistant_msg["id"],
-        role="assistant",
-        text=reply_text,
-        created_at=assistant_msg["created_at"].isoformat(),
-    )
+    reply_text = ""
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"riff-{user.user_id}",
+            system_message=TEACHER_SYSTEM_PROMPT,
+        ).with_model("gemini", "gemini-3-flash-preview")
+        send_mime = "audio/ogg" if mime == "audio/webm" else mime
+        um = UserMessage(
+            text=prompt,
+            file_contents=[FileContentWithMimeType(file_path=str(tmp), mime_type=send_mime)],
+        )
+        reply_text = await _stream_with_retry(chat, um)
+    except Exception:
+        logger.exception("chat_upload failed")
+        if not reply_text:
+            reply_text = "Riff couldn't process that upload — try again?"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    return await _store_assistant_reply(user, reply_text)
 
 
 # =============================================================================
