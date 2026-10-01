@@ -628,6 +628,7 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
 
     file_contents = []
     tmp_files: list[Path] = []
+    reply_text = ""  # ensure defined even if assembly throws
     try:
         if body.image_base64:
             file_contents.append(ImageContent(image_base64=body.image_base64))
@@ -686,16 +687,60 @@ async def chat_message(body: ChatMessageIn, authorization: Optional[str] = Heade
             else UserMessage(text=prompt)
         )
 
-        chunks = []
-        async for ev in chat.stream_message(um):
-            if isinstance(ev, TextDelta):
-                chunks.append(ev.content)
-            elif isinstance(ev, StreamDone):
-                break
-        reply_text = "".join(chunks).strip() or "Hmm, I didn't catch that — try again?"
+        # Gemini via Vertex occasionally returns UNAVAILABLE / APIConnectionError
+        # under load. Retry with exponential backoff before falling back.
+        last_err: Optional[Exception] = None
+        reply_text = ""
+        for attempt in range(3):
+            try:
+                chunks = []
+                async for ev in chat.stream_message(um):
+                    if isinstance(ev, TextDelta):
+                        chunks.append(ev.content)
+                    elif isinstance(ev, StreamDone):
+                        break
+                reply_text = "".join(chunks).strip()
+                if reply_text:
+                    last_err = None
+                    break
+                last_err = RuntimeError("empty_reply")
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(
+                    "LLM attempt %d failed: %s", attempt + 1, repr(e)[:200],
+                )
+            if attempt < 2:
+                await asyncio.sleep(1.0 * (2 ** attempt))  # 1s, then 2s
+
+        if not reply_text:
+            # Give the user a precise reason so they know whether to retry.
+            msg = repr(last_err) if last_err else ""
+            lower = msg.lower()
+            if "unavailable" in lower or "high demand" in lower or "503" in msg:
+                reply_text = (
+                    "Gemini is slammed with traffic right now — give it 10 seconds and tap send again."
+                )
+            elif ("rate" in lower and "limit" in lower) or "429" in msg:
+                reply_text = (
+                    "Hit a short rate limit. Try again in a few seconds."
+                )
+            elif "safety" in lower or "blocked" in lower:
+                reply_text = (
+                    "That one got blocked by a safety filter. Try renaming the file or uploading a different clip."
+                )
+            elif "timeout" in lower:
+                reply_text = (
+                    "That clip took too long to analyze — try a shorter one (under 60s)."
+                )
+            else:
+                reply_text = (
+                    "Riff couldn't analyze that one. Try again — if it keeps failing, upload a shorter clip."
+                )
+            logger.exception("LLM failed after retries")
     except Exception:
-        logger.exception("LLM failed")
-        reply_text = "(Riff hit a snag analyzing that clip. Try one more time?)"
+        logger.exception("chat_message assembly failed")
+        if not reply_text:
+            reply_text = "Riff couldn't process that upload — try again?"
     finally:
         for t in tmp_files:
             try:

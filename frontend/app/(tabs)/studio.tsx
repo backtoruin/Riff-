@@ -30,12 +30,13 @@ import { apiFetch, BACKEND_URL, getToken } from "@/src/api/client";
 import { useTheme, makeStyles, spacing, radius } from "@/src/theme";
 import { RiffMark } from "@/src/components/RiffMark";
 import { ChatBubble, ChatMessage } from "@/src/components/ChatBubble";
+import type { ChatAttachment } from "@/src/components/ChatBubble";
 import { PitchMeter } from "@/src/components/PitchMeter";
 import { RhythmCoach } from "@/src/components/RhythmCoach";
 import { startPitchDetection, PitchState } from "@/src/lib/pitch";
 import { startMidi, MidiState } from "@/src/lib/midi";
 import { recordWebClip, recordNativeClip } from "@/src/lib/record";
-import { pickMediaForUpload } from "@/src/lib/upload";
+import { pickMediaForUpload, postJsonWithProgress } from "@/src/lib/upload";
 import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 
 const useStyles = makeStyles((colors) => ({
@@ -210,6 +211,48 @@ const useStyles = makeStyles((colors) => ({
     letterSpacing: 1,
   },
 
+  // Upload status banner
+  uploadBanner: {
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.sm,
+    padding: spacing.md,
+    backgroundColor: colors.brandTertiary,
+    borderWidth: 1,
+    borderColor: colors.brandPrimary,
+    borderRadius: radius.lg,
+    gap: 6,
+  },
+  uploadRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  uploadStage: {
+    color: colors.brand,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 1,
+  },
+  uploadElapsed: {
+    color: colors.onBrandTertiary,
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  uploadFileName: {
+    color: colors.onSurface,
+    fontSize: 13,
+    fontWeight: "500",
+  },
+  uploadMeta: { color: colors.muted, fontSize: 11 },
+  uploadTrack: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: colors.surfaceTertiary,
+    overflow: "hidden",
+    marginTop: 2,
+  },
+  uploadFill: { height: "100%", backgroundColor: colors.brand },
+
   // Input
   inputBar: {
     flexDirection: "row",
@@ -274,6 +317,14 @@ export default function StudioTab() {
   const [listening, setListening] = useState(false);
   const [rhythmOn, setRhythmOn] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<null | {
+    stage: "picking" | "reading" | "encoding" | "sending" | "analyzing";
+    name?: string;
+    bytes?: number;
+    percent?: number;
+    startedAt: number;
+  }>(null);
+  const [uploadElapsed, setUploadElapsed] = useState(0);
   const [recording, setRecording] = useState(false);
   const [recCountdown, setRecCountdown] = useState(0);
   const [midi, setMidi] = useState<MidiState>({ supported: false, devices: [], events: [] });
@@ -647,46 +698,88 @@ export default function StudioTab() {
     }
   }, [recording, nativeRecorder, midi, buildAudioContext, sendMessageMut]);
 
+  // Live elapsed-time ticker for the upload status banner
+  useEffect(() => {
+    if (!uploadStatus) return;
+    const interval = setInterval(() => {
+      setUploadElapsed(Math.floor((Date.now() - uploadStatus.startedAt) / 1000));
+    }, 500);
+    return () => clearInterval(interval);
+  }, [uploadStatus]);
+
   const pickAndUpload = useCallback(async () => {
     if (uploading) return;
     setUploading(true);
+    const startedAt = Date.now();
+    setUploadStatus({ stage: "picking", startedAt });
+    setUploadElapsed(0);
     try {
-      const picked = await pickMediaForUpload();
-      if (!picked) return; // user canceled
+      const picked = await pickMediaForUpload((s) => {
+        if (s.stage === "picking") {
+          setUploadStatus({ stage: "picking", startedAt });
+        } else if (s.stage === "reading") {
+          setUploadStatus({ stage: "reading", name: s.name, bytes: s.bytes, startedAt });
+        } else if (s.stage === "encoding") {
+          setUploadStatus({
+            stage: "encoding",
+            name: s.name,
+            bytes: s.bytes,
+            percent: s.percent,
+            startedAt,
+          });
+        } else if (s.stage === "ready") {
+          setUploadStatus({ stage: "sending", name: s.name, bytes: s.bytes, percent: 0, startedAt });
+        }
+      });
+      if (!picked) {
+        // user canceled picker
+        return;
+      }
       if ("reason" in (picked as any)) {
         const reason = (picked as any).reason;
+        const details = (picked as any).details;
         const txt =
           reason === "too_large"
             ? "That file is bigger than 20 MB — try trimming it or sending a shorter clip."
             : reason === "unsupported"
-            ? "That file type isn't supported. Try an MP3, MP4, WAV, or MOV."
-            : "Couldn't open that file — try picking it again?";
+            ? `That file type isn't supported${details ? ` (${details})` : ""}. Try an MP3, MP4, WAV, or MOV.`
+            : `Couldn't open that file${details ? ` (${details})` : ""} — try again?`;
         setMessages((m) => [
           ...m,
           { id: `s-${Date.now()}`, role: "assistant", text: txt },
         ]);
         return;
       }
-      const p = picked as Exclude<Awaited<ReturnType<typeof pickMediaForUpload>>, null | { kind: "error"; reason: any }>;
+      const p = picked as Exclude<
+        Awaited<ReturnType<typeof pickMediaForUpload>>,
+        null | { kind: "error"; reason: any; details?: string }
+      >;
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+      const uploadMsgId = `u-${Date.now()}`;
       setMessages((m) => [
         ...m,
         {
-          id: `u-${Date.now()}`,
+          id: uploadMsgId,
           role: "user",
-          text: `📎 Uploaded "${p.name}" (${Math.round(p.bytes / 1024)} KB) — please analyze.`,
+          text: `📎 Shared "${p.name}" — please take a listen.`,
+          attachment: p.localUrl
+            ? {
+                url: p.localUrl,
+                mime: p.mime,
+                kind: p.kind,
+                name: p.name,
+                bytes: p.bytes,
+              }
+            : undefined,
         },
       ]);
       scrollToEnd();
-      setThinkingLabel(
-        p.kind === "video" ? "Riff is watching your clip…" : "Riff is listening to your clip…",
-      );
-      setSending(true);
+
       const payload: any = {
         text:
           p.kind === "video"
-            ? "Please watch this clip of me playing and critique my technique, timing, and tone. Pick 1–2 priorities."
-            : "Please listen to this recording and critique my playing — timing, pitch, tone, feel. Pick 1–2 priorities.",
+            ? `This is a video clip (${p.mime}, ${Math.round(p.bytes / 1024)} KB) of me playing guitar — filename "${p.name}". FIRST, in ONE short sentence describe exactly what you see and hear (instrument, chord/notes if identifiable, tempo feel, dynamics). THEN give 1–2 specific, actionable priorities for me to work on. Be concrete; reference specific details you observed.`
+            : `This is an audio recording (${p.mime}, ${Math.round(p.bytes / 1024)} KB) of me playing — filename "${p.name}". FIRST, in ONE short sentence describe exactly what you hear (instrument, chord/notes if identifiable, tempo feel, tone). THEN give 1–2 specific, actionable priorities. Reference concrete details from the audio.`,
         context: `Student uploaded a ${p.kind} file "${p.name}" (${p.mime}, ${Math.round(p.bytes / 1024)} KB).`,
       };
       if (p.kind === "audio") {
@@ -696,8 +789,90 @@ export default function StudioTab() {
         payload.video_base64 = p.base64;
         payload.video_mime = p.mime;
       }
-      await sendMessageMut.mutateAsync(payload);
-    } catch {
+
+      // Send with upload-progress reporting.
+      setSending(true);
+      const token = await getToken();
+      const url = `${BACKEND_URL}/api/chat/message`;
+      let result;
+      try {
+        result = await postJsonWithProgress<{
+          id: string;
+          role: "assistant";
+          text: string;
+        }>(
+          url,
+          payload,
+          {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token ?? ""}`,
+          },
+          (loaded, total) => {
+            const pct = total > 0 ? (loaded / total) * 100 : 0;
+            // Once bytes are fully uploaded, Gemini is still thinking → switch to analyzing.
+            if (pct < 100) {
+              setUploadStatus({
+                stage: "sending",
+                name: p.name,
+                bytes: p.bytes,
+                percent: pct,
+                startedAt,
+              });
+            } else {
+              setUploadStatus({
+                stage: "analyzing",
+                name: p.name,
+                bytes: p.bytes,
+                percent: 100,
+                startedAt,
+              });
+            }
+          },
+        );
+      } catch (e) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: `s-${Date.now()}`,
+            role: "assistant",
+            text: "Network error during upload — try again?",
+          },
+        ]);
+        return;
+      }
+      if (result.status === 401) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: `s-${Date.now()}`,
+            role: "assistant",
+            text: "Your session expired — sign in again to upload.",
+          },
+        ]);
+        return;
+      }
+      if (result.status >= 400 || !result.json) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: `s-${Date.now()}`,
+            role: "assistant",
+            text: `Upload failed (status ${result.status}). Try again?`,
+          },
+        ]);
+        return;
+      }
+      const reply = result.json;
+      setMessages((m) => [
+        ...m,
+        { id: reply.id, role: "assistant", text: reply.text },
+      ]);
+      scrollToEnd();
+      Haptics.notificationAsync(
+        Haptics.NotificationFeedbackType.Success,
+      ).catch(() => {});
+      qc.invalidateQueries({ queryKey: ["progress"] });
+    } catch (e) {
       setMessages((m) => [
         ...m,
         {
@@ -708,10 +883,32 @@ export default function StudioTab() {
       ]);
     } finally {
       setSending(false);
-      setThinkingLabel(null);
+      setUploadStatus(null);
+      setUploadElapsed(0);
       setUploading(false);
     }
-  }, [uploading, sendMessageMut]);
+  }, [uploading, qc]);
+
+  const playAttachment = useCallback(async (att: ChatAttachment) => {
+    stopCurrentAudio();
+    try {
+      if (Platform.OS === "web") {
+        // Web renders a native <audio>/<video> element with its own controls.
+        return;
+      }
+      const { createAudioPlayer, setAudioModeAsync } = await import("expo-audio");
+      try {
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          allowsRecording: false,
+        } as any);
+      } catch {}
+      const player = createAudioPlayer({ uri: att.url });
+      currentAudioRef.current = player;
+      playingMsgIdRef.current = `attachment-${att.name}`;
+      player.play();
+    } catch {}
+  }, [stopCurrentAudio]);
 
   const sendText = useCallback(async () => {
     const txt = input.trim();
@@ -830,6 +1027,52 @@ export default function StudioTab() {
 
         {rhythmOn && <RhythmCoach />}
 
+        {uploadStatus && (
+          <View style={styles.uploadBanner} testID="upload-status-banner">
+            <View style={styles.uploadRow}>
+              <Text style={styles.uploadStage}>
+                {uploadStatus.stage === "picking" && "PICKING FILE…"}
+                {uploadStatus.stage === "reading" && "READING FILE…"}
+                {uploadStatus.stage === "encoding" &&
+                  `ENCODING ${Math.round(uploadStatus.percent ?? 0)}%`}
+                {uploadStatus.stage === "sending" &&
+                  `SENDING ${Math.round(uploadStatus.percent ?? 0)}%`}
+                {uploadStatus.stage === "analyzing" && "RIFF IS ANALYZING…"}
+              </Text>
+              <Text style={styles.uploadElapsed}>{uploadElapsed}s</Text>
+            </View>
+            {uploadStatus.name && (
+              <Text style={styles.uploadFileName} numberOfLines={1}>
+                {uploadStatus.name}
+              </Text>
+            )}
+            {uploadStatus.bytes ? (
+              <Text style={styles.uploadMeta}>
+                {Math.round(uploadStatus.bytes / 1024).toLocaleString()} KB
+                {uploadStatus.stage === "analyzing" &&
+                  " · Gemini may take 10–60s for video"}
+              </Text>
+            ) : null}
+            {(uploadStatus.stage === "encoding" ||
+              uploadStatus.stage === "sending" ||
+              uploadStatus.stage === "analyzing") && (
+              <View style={styles.uploadTrack}>
+                <View
+                  style={[
+                    styles.uploadFill,
+                    {
+                      width:
+                        uploadStatus.stage === "analyzing"
+                          ? "100%"
+                          : `${Math.max(2, Math.min(100, uploadStatus.percent ?? 0))}%`,
+                    },
+                  ]}
+                />
+              </View>
+            )}
+          </View>
+        )}
+
         {cameraOn && (
           <View style={styles.camPanel} testID="studio-camera-panel">
             <View style={styles.camPreview}>
@@ -926,7 +1169,7 @@ export default function StudioTab() {
         >
           {messages.map((m) => (
             <View key={m.id}>
-              <ChatBubble msg={m} />
+              <ChatBubble msg={m} onPlayAttachment={playAttachment} />
               {m.role === "assistant" && m.id !== "welcome" && (
                 <Pressable
                   testID={`speak-${m.id}`}

@@ -1,0 +1,39 @@
+{
+  "summary": "RiffMaster chat retry + specific error-copy fix verified. All 9 new tests pass (tests 1-2 LIVE against real Gemini via public BASE_URL; tests 3-9 in-process via httpx.AsyncClient+ASGITransport with LlmChat.stream_message and asyncio.sleep monkeypatched). Verified: retry loop runs up to 3 attempts with 1s/2s exponential backoff, two warn-level attempt-failure logs fire, specific error copy returned per exception class (unavailable / rate-limit / safety / timeout / fallback), reply_text is always defined (no unbound-variable crash), tmp files cleaned up after video+audio+LLM failure, chat_messages/history never leaks MongoDB _id. Added /app/backend/tests/test_chat_retry.py (9 pytests, pytest-asyncio installed).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/chat/message", "issue": "Operator precedence subtlety on line 723: `'rate' in lower and 'limit' in lower or '429' in msg` evaluates as `('rate' in lower and 'limit' in lower) or ('429' in msg)` — works for the current branches, but a bare '429' with no 'rate' keyword would be matched here BEFORE the unavailable branch (unavailable branch owns '503' already). Consider parenthesizing for clarity: `(('rate' in lower and 'limit' in lower) or '429' in msg)`."},
+      {"endpoint": "N/A (server startup)", "issue": "FastAPI on_event startup/shutdown is deprecated — use lifespan handlers (DeprecationWarning in test logs). Non-blocking."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_chat_retry.py",
+    "/app/test_reports/pytest/pytest_chat_retry.xml"
+  ],
+  "action_items": [
+    "Optional: parenthesize the rate-limit/429 branch in server.py:723 for readability.",
+    "Optional: migrate @app.on_event to lifespan handlers (not required by this fix)."
+  ],
+  "critical_code_review_comments": [
+    "Retry/backoff logic in chat_message handler is correct: 3 attempts, sleeps 1s then 2s between retries, catches BaseException-ish via `except Exception`, logs warn per attempt, logs error after all retries. Verified by assertions on sleep calls and caplog.",
+    "`reply_text = ''` is initialized before the try block so the finally cleanup path cannot hit UnboundLocalError. Outer except also sets a text reply so no 500 is returned to the client.",
+    "Tmp file cleanup in `finally` runs regardless of retry outcome; test 09 verifies no /tmp/riff_audio_* or /tmp/riff_video_* leftovers after a failing upload with both audio+video attachments.",
+    "/api/chat/history projects out `_id` (`{\"_id\": 0, \"user_id\": 0}`); verified in test 09."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_chat_retry.py (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "N/A"},
+  "seed_data_creation": "Each in-process test creates/cleans up its own user + session_token in Mongo via an async fixture. No persistent seed data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "pytest-asyncio 1.4.0 was installed to support async in-process tests. Run with: `python -m pytest tests/test_chat_retry.py -v --asyncio-mode=auto`. Tests 1-2 require Gemini to be live; tests 3-9 are hermetic (mocked LLM + sleep).",
+  "rca_of_issue": "N/A — this iteration is RE-TEST of a fix. No new bug surfaced. Fix is sound."
+}
